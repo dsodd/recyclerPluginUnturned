@@ -32,7 +32,7 @@ public class ItemRecyclerPlugin : RocketPlugin<ItemRecyclerConfiguration>
 
         recyclableItems = Configuration.Instance.Items.ToDictionary(item => item.Id, item => item);
 
-        // listen for barricade spawns
+        // listen for barricade spawns 
         BarricadeManager.onBarricadeSpawned += OnBarricadeSpawned;  
 
         // subscribe to player connection event to initialize recyclers after the first player joins
