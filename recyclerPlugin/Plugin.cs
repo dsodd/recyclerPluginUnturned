@@ -9,56 +9,38 @@ using System.Linq;
 using System.Collections;
 using Logger = Rocket.Core.Logging.Logger;
 
-public class ItemRecyclerPlugin : RocketPlugin<ItemRecyclerConfiguration>
+public class Plugin : RocketPlugin<Configuration>
 {
-    public static ItemRecyclerPlugin Instance;
-
     private Dictionary<ushort, RecyclableItem> recyclableItems;
-    private ushort recyclerStorageId;
-    private ushort recycledStorageId;
 
     // queue per storage instance to handle recycling process
     private readonly Dictionary<Items, Queue<(ItemJar jar, RecyclableItem recItem)>> recyclingQueues = new Dictionary<Items, Queue<(ItemJar jar, RecyclableItem recItem)>>();
     private readonly HashSet<Items> activeRecyclers = new HashSet<Items>();
-
-    private bool hasInitialized = false;
+    private readonly Dictionary<Items, Coroutine> timeoutCoroutines = new Dictionary<Items, Coroutine>();
 
     protected override void Load()
     {
-        Instance = this;
-
-        recyclerStorageId = Configuration.Instance.Recyclers.RecyclerStorage;
-        recycledStorageId = Configuration.Instance.Recyclers.RecycledStorage;
-
         recyclableItems = Configuration.Instance.Items.ToDictionary(item => item.Id, item => item);
 
-        // listen for barricade spawns 
-        BarricadeManager.onBarricadeSpawned += OnBarricadeSpawned;  
+        BarricadeManager.onBarricadeSpawned += OnBarricadeSpawned;
 
-        // subscribe to player connection event to initialize recyclers after the first player joins
-        U.Events.OnPlayerConnected += OnFirstPlayerConnected;
+        Level.onLevelLoaded += OnLevelLoaded;
 
         Logger.Log("Item Recycler Plugin loaded!");
     }
 
-    // unloads the plugin and cleans up events
     protected override void Unload()
     {
         BarricadeManager.onBarricadeSpawned -= OnBarricadeSpawned;
-        U.Events.OnPlayerConnected -= OnFirstPlayerConnected; // unsubscribe from player connection event
-        Logger.Log("Item Recycler Plugin unloaded.");
+        Level.onLevelLoaded -= OnLevelLoaded;
+        Logger.Log("Item Recycler Plugin unloaded."); 
     }
 
-    // run when the first player connects to register all recyclers
-    private void OnFirstPlayerConnected(Rocket.Unturned.Player.UnturnedPlayer player)
+    private void OnLevelLoaded(int i)
     {
-        if (hasInitialized) return;
-
-        hasInitialized = true;
         StartCoroutine(DelayedRegisterExistingRecyclers());  // register existing recyclers after a short delay
     }
 
-    // registers existing recyclers after the first player connects
     private IEnumerator DelayedRegisterExistingRecyclers()
     {
         yield return new WaitForEndOfFrame();  // wait until the next frame for proper initialization
@@ -68,7 +50,7 @@ public class ItemRecyclerPlugin : RocketPlugin<ItemRecyclerConfiguration>
         {
             foreach (var drop in region.drops)
             {
-                if (drop.asset.id == recyclerStorageId && drop.interactable != null)
+                if (drop.asset.id == Configuration.Instance.Recyclers.RecyclerInput && drop.interactable != null)
                 {
                     OnBarricadeSpawned(region, drop);
                 }
@@ -81,7 +63,7 @@ public class ItemRecyclerPlugin : RocketPlugin<ItemRecyclerConfiguration>
     // handles the logic for when a barricade (recycler) spawns in the game
     private void OnBarricadeSpawned(BarricadeRegion region, BarricadeDrop drop)
     {
-        if (drop.asset.id != recyclerStorageId) return;  // ensure it's a recycler
+        if (drop.asset.id != Configuration.Instance.Recyclers.RecyclerInput) return;  // ensure it's a recycler
 
         InteractableStorage storage = drop.interactable as InteractableStorage;
         if (storage == null || storage.items == null) return;  // ensure the storage is valid
@@ -92,7 +74,7 @@ public class ItemRecyclerPlugin : RocketPlugin<ItemRecyclerConfiguration>
         storage.items.onStateUpdated += () =>
         {
             foreach (ItemJar jar in storage.items.items)
-            {
+                {
                 // check if new items have been added and need recycling
                 if (!lastKnownJars.Contains(jar) &&
                     recyclableItems.TryGetValue(jar.item.id, out RecyclableItem recItem))
@@ -160,7 +142,7 @@ public class ItemRecyclerPlugin : RocketPlugin<ItemRecyclerConfiguration>
             }
 
             // find the closest storage for recycled items
-            InteractableStorage targetStorage = FindClosestStorage(origin, recycledStorageId);
+            InteractableStorage targetStorage = FindClosestStorage(origin, Configuration.Instance.Recyclers.RecyclerOutput);
             if (targetStorage == null)
             {
                 Logger.LogWarning("No recycledStorage found nearby.");
@@ -168,10 +150,30 @@ public class ItemRecyclerPlugin : RocketPlugin<ItemRecyclerConfiguration>
             }
 
             // add the recycled items to the target storage
-            foreach (ushort id in recItem.RecycledIds)
+            foreach (var output in recItem.OutputItemIDs)
             {
-                Item newItem = new Item(id, true);
-                targetStorage.items.addItem(0, 0, 0, newItem);
+                for (int i = 0; i < output.Amount; i++)
+                {
+                    Item newItem = new Item(output.Id, true);
+                    bool placed = false;
+
+                    while (!placed)
+                    {
+                        placed = targetStorage.items.tryAddItem(newItem);
+
+                        if (!placed)
+                        {
+                            Logger.Log($"Storage full. Dropping item {output.Id} in the world...");
+
+                            Vector3 dropPosition = targetStorage.transform.position + Vector3.up * 2f;
+
+                            // drop on the floor
+                            ItemManager.dropItem(newItem, dropPosition, true, false, false);
+
+                            break; // item has been dropped
+                        }
+                    }
+                }
             }
         }
     }
@@ -200,6 +202,16 @@ public class ItemRecyclerPlugin : RocketPlugin<ItemRecyclerConfiguration>
             }
         }
 
-        return closest;  // return the closest storage found
+        return closest;
+    }
+    private IEnumerator ResumeAfterTimeout(Items items, Vector3 origin, float timeout)
+    {
+        yield return new WaitForSeconds(timeout);
+
+        if (!activeRecyclers.Contains(items))
+        {
+            activeRecyclers.Add(items);
+            StartCoroutine(ProcessQueue(origin, items));
+        }
     }
 }
